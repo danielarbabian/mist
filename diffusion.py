@@ -33,21 +33,26 @@ def forward_process(x0: Tensor, t: Tensor, mask_token_id: int) -> tuple[Tensor, 
     return xt, mask
 
 
-def compute_loss(logits: Tensor, x0: Tensor, mask: Tensor) -> Tensor:
-    """Cross-entropy loss on masked positions only.
+def compute_loss(
+    logits: Tensor, x0: Tensor, mask: Tensor, pad_mask: Tensor | None = None
+) -> Tensor:
+    """Cross-entropy loss on masked positions only, excluding padding.
 
     Args:
         logits: Model output, shape (B, T, vocab_size)
         x0: Clean token IDs, shape (B, T)
-        mask: Boolean mask, shape (B, T) — True where masked
+        mask: Boolean mask, shape (B, T) — True where masked by diffusion
+        pad_mask: Boolean mask, shape (B, T) — True for real tokens, False for padding.
+                  If None, all positions are treated as real.
 
     Returns:
-        Scalar loss averaged over masked positions.
+        Scalar loss averaged over masked, non-padding positions.
     """
     B, T, V = logits.shape[0], logits.shape[1], logits.shape[2]
     per_token_loss = logits.reshape(B * T, V).cross_entropy(x0.reshape(B * T), reduction="none")
     per_token_loss = per_token_loss.reshape(B, T)
-    masked_loss = (per_token_loss * mask).sum() / mask.sum().maximum(1)
+    effective_mask = mask * pad_mask if pad_mask is not None else mask
+    masked_loss = (per_token_loss * effective_mask).sum() / effective_mask.sum().maximum(1)
     return masked_loss
 
 
