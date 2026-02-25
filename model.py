@@ -32,7 +32,7 @@ class SelfAttention:
         self.out = nn.Linear(dim, dim)
 
     def __call__(self, x: Tensor) -> Tensor:
-        B, T, C = x.shape
+        B, T, C = x.shape[0], x.shape[1], x.shape[2]
         qkv = (
             self.qkv(x)
             .reshape(B, T, 3, self.n_heads, self.head_dim)
