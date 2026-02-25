@@ -1,4 +1,5 @@
 import argparse
+import csv
 import os
 import time
 
@@ -87,6 +88,11 @@ def train(args: argparse.Namespace) -> None:
     )
     print(f"LR warmup: {args.warmup_steps} steps, max_grad_norm={args.max_grad_norm}")
 
+    log_path = os.path.join(args.checkpoint_dir, "train_log.csv")
+    log_file = open(log_path, "w", newline="")
+    log_writer = csv.writer(log_file)
+    log_writer.writerow(["step", "loss", "lr", "dt"])
+
     Tensor.training = True
     try:
         for step in range(1, args.steps + 1):
@@ -109,11 +115,15 @@ def train(args: argparse.Namespace) -> None:
             clip_grad_norm(params, max_norm=args.max_grad_norm)
             optim.step()
 
+            elapsed = time.monotonic() - t0
+            loss_val = loss.item()
+            log_writer.writerow([step, f"{loss_val:.4f}", f"{lr:.2e}", f"{elapsed:.2f}"])
+
             if step % args.log_every == 0:
-                elapsed = time.monotonic() - t0
                 print(
-                    f"step={step:>5d}  loss={loss.item():.4f}  lr={lr:.2e}  dt={elapsed:.2f}s"
+                    f"step={step:>5d}  loss={loss_val:.4f}  lr={lr:.2e}  dt={elapsed:.2f}s"
                 )
+                log_file.flush()
 
             if step % args.save_every == 0:
                 path = os.path.join(args.checkpoint_dir, f"model_{step}.safetensors")
@@ -121,6 +131,7 @@ def train(args: argparse.Namespace) -> None:
                 print(f"Saved checkpoint: {path}")
     finally:
         Tensor.training = False
+        log_file.close()
 
     path = os.path.join(args.checkpoint_dir, f"model_{args.steps}.safetensors")
     safe_save(get_state_dict(model), path)
@@ -140,7 +151,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-heads", type=int, default=8)
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--log-every", type=int, default=10)
-    parser.add_argument("--save-every", type=int, default=1000)
+    parser.add_argument("--save-every", type=int, default=5000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--warmup-steps", type=int, default=500)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
