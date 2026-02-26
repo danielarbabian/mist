@@ -3,15 +3,13 @@ import csv
 import os
 import time
 
-import tiktoken
 from datasets import load_dataset
 from tinygrad import Tensor, nn
 from tinygrad.nn.state import get_state_dict, safe_save
 
+from config import ENC, VOCAB_SIZE
 from diffusion import compute_loss, forward_process
 from model import DiffusionTransformer
-
-VOCAB_SIZE = 50257  # GPT-2 BPE
 
 
 def clip_grad_norm(parameters: list[Tensor], max_norm: float = 1.0) -> Tensor:
@@ -38,7 +36,7 @@ def get_lr(step: int, warmup_steps: int, base_lr: float) -> float:
 
 
 def make_batch(
-    ds, iterator, enc: tiktoken.Encoding, batch_size: int, seq_len: int, pad_token: int
+    ds, iterator, enc, batch_size: int, seq_len: int, pad_token: int
 ):
     """Build a batch of token sequences. Returns (tokens, padding_mask).
 
@@ -67,7 +65,7 @@ def train(args: argparse.Namespace) -> None:
 
     Tensor.manual_seed(args.seed)
 
-    enc = tiktoken.get_encoding("gpt2")
+    enc = ENC
     ds = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
     iterator = iter(ds)
 
@@ -89,12 +87,13 @@ def train(args: argparse.Namespace) -> None:
     print(f"LR warmup: {args.warmup_steps} steps, max_grad_norm={args.max_grad_norm}")
 
     log_path = os.path.join(args.checkpoint_dir, "train_log.csv")
-    log_file = open(log_path, "w", newline="")
-    log_writer = csv.writer(log_file)
-    log_writer.writerow(["step", "loss", "lr", "dt"])
+    log_file = None
 
     Tensor.training = True
     try:
+        log_file = open(log_path, "w", newline="")
+        log_writer = csv.writer(log_file)
+        log_writer.writerow(["step", "loss", "lr", "dt"])
         for step in range(1, args.steps + 1):
             t0 = time.monotonic()
 
@@ -131,7 +130,8 @@ def train(args: argparse.Namespace) -> None:
                 print(f"Saved checkpoint: {path}")
     finally:
         Tensor.training = False
-        log_file.close()
+        if log_file is not None:
+            log_file.close()
 
     path = os.path.join(args.checkpoint_dir, f"model_{args.steps}.safetensors")
     safe_save(get_state_dict(model), path)

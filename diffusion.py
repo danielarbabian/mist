@@ -1,4 +1,5 @@
 import math
+from collections.abc import Callable
 from typing import Protocol
 
 from tinygrad import Tensor
@@ -56,12 +57,23 @@ def compute_loss(
     return masked_loss
 
 
+def _sample_tokens(logits: Tensor, temperature: float) -> Tensor:
+    """Sample token IDs from logits using temperature scaling + Gumbel-max trick."""
+    if temperature < 1e-8:
+        return logits.argmax(axis=-1)
+    u = Tensor.rand(*logits.shape).clip(1e-20, 1.0 - 1e-7)
+    gumbel_noise = -(-(u.log())).log()
+    return ((logits / temperature) + gumbel_noise).argmax(axis=-1)
+
+
 def sample(
     model: Denoiser,
     seq_len: int,
     num_steps: int,
     vocab_size: int,
     batch_size: int = 1,
+    temperature: float = 0.8,
+    on_step: Callable[[int, int, Tensor, Tensor], None] | None = None,
 ) -> Tensor:
     """Generate text by iterative unmasking.
 
@@ -74,10 +86,17 @@ def sample(
         num_steps: Number of denoising steps
         vocab_size: Vocabulary size (mask_token_id = vocab_size)
         batch_size: Number of sequences to generate
+        temperature: Sampling temperature (0 = greedy, higher = more random)
+        on_step: Optional callback(step, num_steps, xt, sampled) called after each step
 
     Returns:
         Generated token IDs, shape (batch_size, seq_len)
     """
+    if num_steps < 1:
+        raise ValueError(f"num_steps must be >= 1, got {num_steps}")
+    if temperature < 0:
+        raise ValueError(f"temperature must be >= 0, got {temperature}")
+
     mask_token_id = vocab_size
     xt = Tensor.full((batch_size, seq_len), mask_token_id)
 
@@ -87,12 +106,11 @@ def sample(
 
         t_tensor = Tensor.full((batch_size,), t)
         logits = model(xt, t_tensor)
-        sampled = logits.argmax(axis=-1)
+        sampled = _sample_tokens(logits, temperature)
 
         is_masked = xt == mask_token_id
 
         if i == 1:
-            # Final step: unmask everything remaining
             xt = Tensor.where(is_masked, sampled, xt)
         else:
             alpha_t = noise_schedule(Tensor([t])).item()
@@ -101,5 +119,8 @@ def sample(
             unmask_prob = (alpha_prev - alpha_t) / (1 - alpha_t + eps)
             unmask = is_masked * (Tensor.rand(batch_size, seq_len) < unmask_prob)
             xt = Tensor.where(unmask, sampled, xt)
+
+        if on_step is not None:
+            on_step(num_steps - i + 1, num_steps, xt, sampled)
 
     return xt
