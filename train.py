@@ -29,12 +29,38 @@ def clip_grad_norm(parameters: list[Tensor], max_norm: float = 1.0) -> Tensor:
     return total_norm
 
 
-def get_lr(step: int, warmup_steps: int, total_steps: int, base_lr: float, min_lr: float = 0.0) -> float:
-    """Linear warmup then cosine decay to min_lr. step is 1-indexed."""
+def get_lr(
+    step: int,
+    warmup_steps: int,
+    total_steps: int,
+    base_lr: float,
+    min_lr: float,
+    schedule: str,
+) -> float:
+    """Linear warmup then cosine decay or constant. step is 1-indexed."""
     if step <= warmup_steps:
         return base_lr * step / warmup_steps
+    if schedule == "constant":
+        return base_lr
     progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
     return min_lr + (base_lr - min_lr) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def make_ema_state(model) -> dict[str, Tensor]:
+    """Clone current model state into fresh Tensors for EMA tracking."""
+    return {
+        k: Tensor(v.numpy(), dtype=v.dtype, requires_grad=False)
+        for k, v in get_state_dict(model).items()
+    }
+
+
+def update_ema(ema_state: dict[str, Tensor], model, decay: float) -> None:
+    """In-place EMA update: ema = decay * ema + (1 - decay) * model."""
+    updates = [
+        ema_state[k].assign(ema_state[k] * decay + v.detach() * (1 - decay))
+        for k, v in get_state_dict(model).items()
+    ]
+    Tensor.realize(*updates)
 
 
 def _encode_padded(story: str, enc, seq_len: int, pad_token: int) -> tuple[list[int], list[bool]]:
@@ -148,12 +174,17 @@ def train(args: argparse.Namespace) -> None:
     params = nn.state.get_parameters(model)
     optim = nn.optim.Adam(params, lr=args.lr)
 
+    ema_state = make_ema_state(model) if args.ema_decay > 0 else None
+
     param_count = sum(p.numel() for p in params)
     print(f"Model params: {param_count / 1e6:.1f}M")
     print(
         f"Training for {args.steps} steps, batch_size={args.batch_size}, seq_len={args.seq_len}"
     )
-    print(f"LR: {args.warmup_steps}-step warmup → cosine decay to {args.min_lr}, max_grad_norm={args.max_grad_norm}")
+    lr_tail = f"cosine decay to {args.min_lr}" if args.lr_schedule == "cosine" else "constant"
+    print(f"LR: {args.warmup_steps}-step warmup → {lr_tail}, max_grad_norm={args.max_grad_norm}")
+    if ema_state is not None:
+        print(f"EMA enabled, decay={args.ema_decay}")
 
     log_path = os.path.join(args.checkpoint_dir, "train_log.csv")
     log_file = None
@@ -170,8 +201,9 @@ def train(args: argparse.Namespace) -> None:
         for step in range(1, args.steps + 1):
             t0 = time.monotonic()
 
-            # LR schedule: linear warmup then cosine decay
-            lr = get_lr(step, args.warmup_steps, args.steps, args.lr, args.min_lr)
+            lr = get_lr(
+                step, args.warmup_steps, args.steps, args.lr, args.min_lr, args.lr_schedule
+            )
             optim.lr.assign(Tensor([lr], dtype=optim.lr.dtype)).realize()
 
             x0, pad_mask, iterator, epoch = make_batch(
@@ -186,6 +218,9 @@ def train(args: argparse.Namespace) -> None:
             loss.backward()
             grad_norm = clip_grad_norm(params, max_norm=args.max_grad_norm)
             optim.step()
+
+            if ema_state is not None:
+                update_ema(ema_state, model, args.ema_decay)
 
             elapsed = time.monotonic() - t0
             loss_val = loss.item()
@@ -222,17 +257,26 @@ def train(args: argparse.Namespace) -> None:
                 log_file.flush()
 
             if step % args.save_every == 0:
-                path = os.path.join(args.checkpoint_dir, f"model_{step}.safetensors")
-                safe_save(get_state_dict(model), path)
-                print(f"Saved checkpoint: {path}")
+                _save_checkpoint(args.checkpoint_dir, step, model, ema_state)
     finally:
         Tensor.training = False
         if log_file is not None:
             log_file.close()
 
-    path = os.path.join(args.checkpoint_dir, f"model_{args.steps}.safetensors")
+    _save_checkpoint(args.checkpoint_dir, args.steps, model, ema_state)
+    print("Training complete.")
+
+
+def _save_checkpoint(
+    checkpoint_dir: str, step: int, model, ema_state: dict[str, Tensor] | None
+) -> None:
+    path = os.path.join(checkpoint_dir, f"model_{step}.safetensors")
     safe_save(get_state_dict(model), path)
-    print(f"Training complete. Final checkpoint: {path}")
+    print(f"Saved checkpoint: {path}")
+    if ema_state is not None:
+        ema_path = os.path.join(checkpoint_dir, f"model_{step}_ema.safetensors")
+        safe_save(ema_state, ema_path)
+        print(f"Saved EMA checkpoint: {ema_path}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -253,6 +297,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=500)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--min-lr", type=float, default=0.0)
+    parser.add_argument("--lr-schedule", choices=["cosine", "constant"], default="cosine")
+    parser.add_argument("--ema-decay", type=float, default=0.999, help="0 disables EMA")
     parser.add_argument("--val-every", type=int, default=500)
     parser.add_argument("--val-size", type=int, default=256)
     return parser.parse_args()
