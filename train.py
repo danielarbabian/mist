@@ -2,6 +2,7 @@ import argparse
 import csv
 import math
 import os
+import random
 import time
 
 from datasets import load_dataset
@@ -175,6 +176,7 @@ def train(args: argparse.Namespace) -> None:
     optim = nn.optim.Adam(params, lr=args.lr)
 
     ema_state = make_ema_state(model) if args.ema_decay > 0 else None
+    sc_rng = random.Random(args.seed + 999) if args.self_conditioning else None
 
     param_count = sum(p.numel() for p in params)
     print(f"Model params: {param_count / 1e6:.1f}M")
@@ -185,6 +187,8 @@ def train(args: argparse.Namespace) -> None:
     print(f"LR: {args.warmup_steps}-step warmup → {lr_tail}, max_grad_norm={args.max_grad_norm}")
     if ema_state is not None:
         print(f"EMA enabled, decay={args.ema_decay}")
+    if sc_rng is not None:
+        print("Self-conditioning enabled (p=0.5)")
 
     log_path = os.path.join(args.checkpoint_dir, "train_log.csv")
     log_file = None
@@ -211,7 +215,14 @@ def train(args: argparse.Namespace) -> None:
             )
             t = Tensor.rand(args.batch_size)
             xt, mask = forward_process(x0, t, mask_token_id=VOCAB_SIZE)
-            logits = model(xt, t)
+
+            self_cond = None
+            if sc_rng is not None and sc_rng.random() < 0.5:
+                # First forward pass with no SC; detach its argmax and feed back
+                # as SC to the backpropped pass.
+                self_cond = model(xt, t, None).detach().argmax(axis=-1)
+
+            logits = model(xt, t, self_cond)
             loss = compute_loss(logits, x0, mask, pad_mask)
 
             optim.zero_grad()
@@ -299,6 +310,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-lr", type=float, default=0.0)
     parser.add_argument("--lr-schedule", choices=["cosine", "constant"], default="cosine")
     parser.add_argument("--ema-decay", type=float, default=0.999, help="0 disables EMA")
+    parser.add_argument("--self-conditioning", action="store_true")
     parser.add_argument("--val-every", type=int, default=500)
     parser.add_argument("--val-size", type=int, default=256)
     return parser.parse_args()

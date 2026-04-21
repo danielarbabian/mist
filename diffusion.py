@@ -8,7 +8,7 @@ from tinygrad import Tensor
 class Denoiser(Protocol):
     vocab_size: int
 
-    def __call__(self, x: Tensor, t: Tensor) -> Tensor: ...
+    def __call__(self, x: Tensor, t: Tensor, self_cond: Tensor | None = None) -> Tensor: ...
 
 
 def noise_schedule(t: Tensor) -> Tensor:
@@ -73,6 +73,7 @@ def sample(
     vocab_size: int,
     batch_size: int = 1,
     temperature: float = 0.8,
+    self_cond: bool = False,
     on_step: Callable[[int, int, Tensor, Tensor], None] | None = None,
 ) -> Tensor:
     """Generate text by iterative unmasking.
@@ -87,6 +88,9 @@ def sample(
         vocab_size: Vocabulary size (mask_token_id = vocab_size)
         batch_size: Number of sequences to generate
         temperature: Sampling temperature (0 = greedy, higher = more random)
+        self_cond: If True, feed the previous step's argmax prediction back
+                   as a self-conditioning signal. Requires a model trained with
+                   --self-conditioning; has no effect on models trained without.
         on_step: Optional callback(step, num_steps, xt, sampled) called after each step
 
     Returns:
@@ -99,14 +103,17 @@ def sample(
 
     mask_token_id = vocab_size
     xt = Tensor.full((batch_size, seq_len), mask_token_id)
+    sc_pred: Tensor | None = None
 
     for i in range(num_steps, 0, -1):
         t = i / num_steps
         t_prev = (i - 1) / num_steps
 
         t_tensor = Tensor.full((batch_size,), t)
-        logits = model(xt, t_tensor)
+        logits = model(xt, t_tensor, sc_pred if self_cond else None)
         sampled = _sample_tokens(logits, temperature)
+        if self_cond:
+            sc_pred = logits.argmax(axis=-1).detach()
 
         is_masked = xt == mask_token_id
 

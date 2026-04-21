@@ -81,6 +81,15 @@ class DiffusionTransformer:
         self.token_emb = nn.Embedding(vocab_size + 1, dim)
         self.pos_emb = nn.Embedding(max_seq_len, dim)
 
+        # Self-conditioning embedding. Zero-initialised so it's a no-op until
+        # the model is trained with --self-conditioning enabled.
+        self.self_cond_emb = nn.Embedding(vocab_size + 1, dim)
+        self.self_cond_emb.weight = Tensor.zeros(
+            vocab_size + 1, dim,
+            dtype=self.self_cond_emb.weight.dtype,
+            requires_grad=True,
+        )
+
         self.time_emb = SinusoidalEmbedding(dim)
         self.time_w1 = nn.Linear(dim, dim * 4)
         self.time_w2 = nn.Linear(dim * 4, dim)
@@ -89,11 +98,15 @@ class DiffusionTransformer:
         self.out_norm = nn.LayerNorm(dim)
         self.out_proj = nn.Linear(dim, vocab_size)
 
-    def __call__(self, x: Tensor, t: Tensor) -> Tensor:
+    def __call__(
+        self, x: Tensor, t: Tensor, self_cond: Tensor | None = None
+    ) -> Tensor:
         assert x.shape[1] <= self.max_seq_len, (
             f"seq_len {x.shape[1]} exceeds max_seq_len {self.max_seq_len}"
         )
         h = self.token_emb(x) + self.pos_emb(Tensor.arange(x.shape[1]))
+        if self_cond is not None:
+            h = h + self.self_cond_emb(self_cond)
         cond = self.time_w2(self.time_w1(self.time_emb(t)).gelu())
         for block in self.blocks:
             h = block(h, cond)

@@ -99,6 +99,7 @@ def generate(args: argparse.Namespace) -> None:
                     num_steps=args.num_steps,
                     vocab_size=VOCAB_SIZE,
                     temperature=args.temperature,
+                    self_cond=args.self_cond,
                     on_step=on_step,
                 )
                 if i < args.num_samples - 1:
@@ -110,6 +111,7 @@ def generate(args: argparse.Namespace) -> None:
                     num_steps=args.num_steps,
                     vocab_size=VOCAB_SIZE,
                     temperature=args.temperature,
+                    self_cond=args.self_cond,
                 )
                 token_ids = tokens[0].numpy().tolist()
                 token_ids = [min(int(t), VOCAB_SIZE - 1) for t in token_ids]
@@ -133,6 +135,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-heads", type=int, default=8)
     parser.add_argument("--stream", action="store_true", help="Show denoising process in real time")
     parser.add_argument("--stream-every", type=int, default=5, help="Render every Nth step when streaming")
+    parser.add_argument(
+        "--self-cond",
+        action="store_true",
+        help="Enable self-conditioning at inference (requires model trained with --self-conditioning)",
+    )
     return parser.parse_args()
 
 
