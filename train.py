@@ -37,6 +37,14 @@ def get_lr(step: int, warmup_steps: int, total_steps: int, base_lr: float, min_l
     return min_lr + (base_lr - min_lr) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
+def _encode_padded(story: str, enc, seq_len: int, pad_token: int) -> tuple[list[int], list[bool]]:
+    ids = enc.encode(story)[:seq_len]
+    real_len = len(ids)
+    if real_len < seq_len:
+        ids = ids + [pad_token] * (seq_len - real_len)
+    return ids, [True] * real_len + [False] * (seq_len - real_len)
+
+
 def make_batch(
     ds, iterator, enc, batch_size: int, seq_len: int, pad_token: int, epoch: int, seed: int
 ):
@@ -55,13 +63,58 @@ def make_batch(
             ds = ds.shuffle(seed=seed + epoch)
             iterator = iter(ds)
             story = next(iterator)["text"]
-        ids = enc.encode(story)[:seq_len]
-        real_len = len(ids)
-        if real_len < seq_len:
-            ids = ids + [pad_token] * (seq_len - real_len)
+        ids, pm = _encode_padded(story, enc, seq_len, pad_token)
         tokens.append(ids)
-        pad_masks.append([True] * real_len + [False] * (seq_len - real_len))
+        pad_masks.append(pm)
     return Tensor(tokens), Tensor(pad_masks), iterator, epoch
+
+
+def make_val_batches(
+    stories: list[str], enc, batch_size: int, seq_len: int, pad_token: int
+) -> list[tuple[Tensor, Tensor]]:
+    """Pre-tokenise a fixed list of stories into (tokens, pad_mask) batches.
+
+    Drops any incomplete tail batch so every batch has exactly batch_size rows.
+    """
+    batches: list[tuple[Tensor, Tensor]] = []
+    buf_tokens: list[list[int]] = []
+    buf_masks: list[list[bool]] = []
+    for story in stories:
+        ids, pm = _encode_padded(story, enc, seq_len, pad_token)
+        buf_tokens.append(ids)
+        buf_masks.append(pm)
+        if len(buf_tokens) == batch_size:
+            batches.append((Tensor(buf_tokens), Tensor(buf_masks)))
+            buf_tokens, buf_masks = [], []
+    return batches
+
+
+def compute_val_loss(
+    model, val_batches: list[tuple[Tensor, Tensor]], mask_token_id: int, val_seed: int
+) -> float:
+    """Forward-only eval across fixed batches.
+
+    Re-seeds the RNG before eval so val loss is reproducible across checkpoints.
+    Side effect: advances the global RNG, so training sees a deterministic but
+    different sequence than a run without val eval.
+    """
+    was_training = Tensor.training
+    Tensor.training = False
+    try:
+        Tensor.manual_seed(val_seed)
+        total = 0.0
+        n = 0
+        for x0, pad_mask in val_batches:
+            B = x0.shape[0]
+            t = Tensor.rand(B)
+            xt, mask = forward_process(x0, t, mask_token_id=mask_token_id)
+            logits = model(xt, t)
+            loss = compute_loss(logits, x0, mask, pad_mask)
+            total += loss.item()
+            n += 1
+        return total / max(n, 1)
+    finally:
+        Tensor.training = was_training
 
 
 def train(args: argparse.Namespace) -> None:
@@ -73,6 +126,17 @@ def train(args: argparse.Namespace) -> None:
     ds = load_dataset("roneneldan/TinyStories", split="train")
     ds = ds.shuffle(seed=args.seed)
     iterator = iter(ds)
+
+    val_batches: list[tuple[Tensor, Tensor]] = []
+    if args.val_every > 0 and args.val_size > 0:
+        val_ds = load_dataset("roneneldan/TinyStories", split="validation")
+        val_stories = [val_ds[i]["text"] for i in range(min(args.val_size, len(val_ds)))]
+        val_batches = make_val_batches(
+            val_stories, enc, args.batch_size, args.seq_len, enc.eot_token
+        )
+        print(
+            f"Val: {len(val_batches)} batches ({len(val_batches) * args.batch_size} sequences), every {args.val_every} steps"
+        )
 
     model = DiffusionTransformer(
         vocab_size=VOCAB_SIZE,
@@ -93,13 +157,16 @@ def train(args: argparse.Namespace) -> None:
 
     log_path = os.path.join(args.checkpoint_dir, "train_log.csv")
     log_file = None
+    val_seed = args.seed + 1_000_000
 
     epoch = 0
     Tensor.training = True
     try:
         log_file = open(log_path, "w", newline="")
         log_writer = csv.writer(log_file)
-        log_writer.writerow(["step", "loss", "lr", "dt"])
+        log_writer.writerow(
+            ["step", "loss", "val_loss", "grad_norm", "lr", "tokens_per_sec", "epoch", "dt"]
+        )
         for step in range(1, args.steps + 1):
             t0 = time.monotonic()
 
@@ -117,17 +184,41 @@ def train(args: argparse.Namespace) -> None:
 
             optim.zero_grad()
             loss.backward()
-            clip_grad_norm(params, max_norm=args.max_grad_norm)
+            grad_norm = clip_grad_norm(params, max_norm=args.max_grad_norm)
             optim.step()
 
             elapsed = time.monotonic() - t0
             loss_val = loss.item()
-            log_writer.writerow([step, f"{loss_val:.4f}", f"{lr:.2e}", f"{elapsed:.2f}"])
+            grad_norm_val = grad_norm.item()
+            tokens_per_sec = args.batch_size * args.seq_len / max(elapsed, 1e-9)
 
-            if step % args.log_every == 0:
-                print(
-                    f"step={step:>5d}  loss={loss_val:.4f}  lr={lr:.2e}  dt={elapsed:.2f}s"
+            val_loss_str = ""
+            if val_batches and step % args.val_every == 0:
+                val_loss = compute_val_loss(model, val_batches, VOCAB_SIZE, val_seed)
+                val_loss_str = f"{val_loss:.4f}"
+
+            log_writer.writerow(
+                [
+                    step,
+                    f"{loss_val:.4f}",
+                    val_loss_str,
+                    f"{grad_norm_val:.4f}",
+                    f"{lr:.2e}",
+                    f"{tokens_per_sec:.0f}",
+                    epoch,
+                    f"{elapsed:.2f}",
+                ]
+            )
+
+            if step % args.log_every == 0 or val_loss_str:
+                msg = (
+                    f"step={step:>5d}  loss={loss_val:.4f}  "
+                    f"grad={grad_norm_val:.2f}  lr={lr:.2e}  "
+                    f"tps={tokens_per_sec:.0f}  dt={elapsed:.2f}s"
                 )
+                if val_loss_str:
+                    msg += f"  val={val_loss_str}"
+                print(msg)
                 log_file.flush()
 
             if step % args.save_every == 0:
@@ -162,6 +253,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=500)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--min-lr", type=float, default=0.0)
+    parser.add_argument("--val-every", type=int, default=500)
+    parser.add_argument("--val-size", type=int, default=256)
     return parser.parse_args()
 
 

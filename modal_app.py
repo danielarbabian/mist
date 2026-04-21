@@ -75,6 +75,8 @@ def train_on_modal(
     max_grad_norm: float,
     log_every: int,
     save_every: int,
+    val_every: int,
+    val_size: int,
     run_name: str,
     slack_webhook_url: str | None,
 ) -> None:
@@ -96,6 +98,8 @@ def train_on_modal(
         checkpoint_dir=run_dir,
         log_every=log_every,
         save_every=save_every,
+        val_every=val_every,
+        val_size=val_size,
         seed=seed,
         warmup_steps=warmup_steps,
         max_grad_norm=max_grad_norm,
@@ -129,6 +133,8 @@ def main(
     max_grad_norm: float = 1.0,
     log_every: int = 10,
     save_every: int = 5000,
+    val_every: int = 500,
+    val_size: int = 256,
     run_name: str = "default",
     slack_webhook_url: str | None = None,
 ) -> None:
@@ -146,6 +152,8 @@ def main(
         max_grad_norm=max_grad_norm,
         log_every=log_every,
         save_every=save_every,
+        val_every=val_every,
+        val_size=val_size,
         run_name=run_name,
         slack_webhook_url=slack_webhook_url,
     )
