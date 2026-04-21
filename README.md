@@ -46,17 +46,17 @@ Trained on [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories)
 
 The model was trained for 10,000 steps on an RTX 4090 via RunPod. The full run cost under $4 and took roughly 6.5 hours of wall time (though the actual compute time per step was much lower, as explained below).
 
-| Param | Value |
-|-------|-------|
-| Parameters | ~33M |
-| Vocab | 50,257 (GPT-2 BPE via tiktoken) |
-| Dim | 256 |
-| Heads | 8 |
-| Layers | 6 |
-| Seq length | 128 |
-| Batch size | 64 |
-| Optimiser | Adam, lr=3e-4 with 500-step linear warmup |
-| Gradient clipping | max norm 1.0 |
+| Param             | Value                                     |
+| ----------------- | ----------------------------------------- |
+| Parameters        | ~33M                                      |
+| Vocab             | 50,257 (GPT-2 BPE via tiktoken)           |
+| Dim               | 256                                       |
+| Heads             | 8                                         |
+| Layers            | 6                                         |
+| Seq length        | 128                                       |
+| Batch size        | 64                                        |
+| Optimiser         | Adam, lr=3e-4 with 500-step linear warmup |
+| Gradient clipping | max norm 1.0                              |
 
 ### Training Curves
 
@@ -68,7 +68,7 @@ The **top right** panel zooms into the last 5,000 steps and reveals that the EMA
 
 The **bottom left** panel shows a clean linear warmup over the first 500 steps up to 3e-4, followed by a constant learning rate for the remainder of training, which kept things stable with no signs of divergence.
 
-The **bottom right** panel is the most telling. Step duration starts at around 0.5 seconds for the first ~1,000 steps, but then begins climbing steadily and reaches roughly 5 seconds per step by the end of training. I chose to stream the dataset from HuggingFace rather than downloading it to disk, which seemed reasonable at the time since TinyStories is only ~2 GB and I didn't think the latency would matter much. Turns out it matters a lot. As the iterator moves deeper into the dataset's parquet shards, the network fetch latency compounds and the GPU ends up sitting idle waiting for the next batch. The occasional spikes to 10 to 18 seconds are likely shard boundaries where a new file needs to be downloaded. What should have been a ~90 minute run ended up taking over 6 hours, which is a bit embarrassing in hindsight. Lesson learned: just download the data.
+The **bottom right** panel is the most telling. Step duration starts at around 0.5 seconds for the first ~1,000 steps, but then begins climbing steadily and reaches roughly 5 seconds per step by the end of training. I chose to stream the dataset from HuggingFace rather than downloading it to disk, which seemed reasonable at the time since TinyStories is roughly 2 GB and I didn't think the latency would matter much. Turns out it matters a lot. As the iterator moves deeper into the dataset's parquet shards, the network fetch latency compounds and the GPU ends up sitting idle waiting for the next batch. The occasional spikes to 10 to 18 seconds are likely shard boundaries where a new file needs to be downloaded. What should have been a ~90 minute run ended up taking over 6 hours, which is a bit embarrassing in hindsight. Lesson learned: just download the data.
 
 ### Sample Outputs
 
@@ -85,6 +85,26 @@ to make something special.
 ```
 
 The outputs are rough but recognisably English, with clear story structure ("Once upon a time"), character references, and sentence-level coherence. Grammar breaks down over longer spans and the stories tend to lose the thread after a few sentences, which is about what you would expect from a 33M parameter model trained for only 10K steps.
+
+## Training on Modal
+
+Training runs on [Modal](https://modal.com), so your local machine only submits the job — you can close your laptop, go to sleep, and the run keeps going on Modal's infrastructure.
+
+```bash
+uv sync                          # installs modal + the rest of the deps
+uv run modal setup               # one-time auth
+
+uv run modal run --detach modal_app.py --steps 20000 --run-name v2
+```
+
+Checkpoints and the training log land on a persistent Modal volume under `<run_name>/`. Pull them back with:
+
+```bash
+uv run modal volume get mist-checkpoints v2/model_20000.safetensors ./
+uv run modal volume get mist-checkpoints v2/train_log.csv ./
+```
+
+Pass `--slack-webhook-url=$SLACK_WEBHOOK_URL` to get a ping on completion or failure. GPU and other knobs live in `modal_app.py`.
 
 ## Sampling
 
@@ -147,7 +167,8 @@ mist/
 ├── model.py       # transformer + timestep conditioning
 ├── diffusion.py   # noise schedule, forward corruption, reverse sampling
 ├── train.py       # training loop with CSV logging
-└── sample.py      # generate text, visualise the denoising process
+├── sample.py      # generate text, visualise the denoising process
+└── modal_app.py   # Modal entry point for cloud training
 ```
 
 ## Key Decisions

@@ -1,5 +1,6 @@
 import argparse
 import csv
+import math
 import os
 import time
 
@@ -28,17 +29,18 @@ def clip_grad_norm(parameters: list[Tensor], max_norm: float = 1.0) -> Tensor:
     return total_norm
 
 
-def get_lr(step: int, warmup_steps: int, base_lr: float) -> float:
-    """Linear warmup then constant LR. step is 1-indexed."""
+def get_lr(step: int, warmup_steps: int, total_steps: int, base_lr: float, min_lr: float = 0.0) -> float:
+    """Linear warmup then cosine decay to min_lr. step is 1-indexed."""
     if step <= warmup_steps:
         return base_lr * step / warmup_steps
-    return base_lr
+    progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+    return min_lr + (base_lr - min_lr) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
 def make_batch(
-    ds, iterator, enc, batch_size: int, seq_len: int, pad_token: int
+    ds, iterator, enc, batch_size: int, seq_len: int, pad_token: int, epoch: int, seed: int
 ):
-    """Build a batch of token sequences. Returns (tokens, padding_mask).
+    """Build a batch of token sequences. Returns (tokens, padding_mask, iterator, epoch).
 
     Restarts the dataset iterator on exhaustion for multi-epoch training.
     padding_mask is True for real tokens, False for padding.
@@ -49,6 +51,8 @@ def make_batch(
         try:
             story = next(iterator)["text"]
         except StopIteration:
+            epoch += 1
+            ds = ds.shuffle(seed=seed + epoch)
             iterator = iter(ds)
             story = next(iterator)["text"]
         ids = enc.encode(story)[:seq_len]
@@ -57,7 +61,7 @@ def make_batch(
             ids = ids + [pad_token] * (seq_len - real_len)
         tokens.append(ids)
         pad_masks.append([True] * real_len + [False] * (seq_len - real_len))
-    return Tensor(tokens), Tensor(pad_masks), iterator
+    return Tensor(tokens), Tensor(pad_masks), iterator, epoch
 
 
 def train(args: argparse.Namespace) -> None:
@@ -66,7 +70,8 @@ def train(args: argparse.Namespace) -> None:
     Tensor.manual_seed(args.seed)
 
     enc = ENC
-    ds = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
+    ds = load_dataset("roneneldan/TinyStories", split="train")
+    ds = ds.shuffle(seed=args.seed)
     iterator = iter(ds)
 
     model = DiffusionTransformer(
@@ -84,11 +89,12 @@ def train(args: argparse.Namespace) -> None:
     print(
         f"Training for {args.steps} steps, batch_size={args.batch_size}, seq_len={args.seq_len}"
     )
-    print(f"LR warmup: {args.warmup_steps} steps, max_grad_norm={args.max_grad_norm}")
+    print(f"LR: {args.warmup_steps}-step warmup → cosine decay to {args.min_lr}, max_grad_norm={args.max_grad_norm}")
 
     log_path = os.path.join(args.checkpoint_dir, "train_log.csv")
     log_file = None
 
+    epoch = 0
     Tensor.training = True
     try:
         log_file = open(log_path, "w", newline="")
@@ -97,12 +103,12 @@ def train(args: argparse.Namespace) -> None:
         for step in range(1, args.steps + 1):
             t0 = time.monotonic()
 
-            # LR warmup
-            lr = get_lr(step, args.warmup_steps, args.lr)
+            # LR schedule: linear warmup then cosine decay
+            lr = get_lr(step, args.warmup_steps, args.steps, args.lr, args.min_lr)
             optim.lr.assign(Tensor([lr], dtype=optim.lr.dtype)).realize()
 
-            x0, pad_mask, iterator = make_batch(
-                ds, iterator, enc, args.batch_size, args.seq_len, enc.eot_token
+            x0, pad_mask, iterator, epoch = make_batch(
+                ds, iterator, enc, args.batch_size, args.seq_len, enc.eot_token, epoch, args.seed
             )
             t = Tensor.rand(args.batch_size)
             xt, mask = forward_process(x0, t, mask_token_id=VOCAB_SIZE)
@@ -144,7 +150,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--steps", type=int, default=10000)
+    parser.add_argument("--steps", type=int, default=20000)
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--dim", type=int, default=256)
     parser.add_argument("--n-layers", type=int, default=6)
@@ -155,6 +161,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--warmup-steps", type=int, default=500)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--min-lr", type=float, default=0.0)
     return parser.parse_args()
 
 
